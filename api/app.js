@@ -5,7 +5,7 @@ import OpenAI from "openai";
 
 const app = express();
 
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "3mb" }));
 
 const answerLabels = {
   visitType: "診療区分",
@@ -72,7 +72,7 @@ const summarySchema = {
 };
 
 function answerValue(answers = {}, key, fallback = "発言なし") {
-  const value = answers[key];
+  const value = answers?.[key];
   if (Array.isArray(value)) return value.length ? value.join("、") : fallback;
   if (value === null || value === undefined || String(value).trim() === "") return fallback;
   return String(value).trim();
@@ -266,22 +266,121 @@ function buildSlackText(intake) {
   return lines.join("\n");
 }
 
-async function notifySlack(intake) {
-  if (!process.env.SLACK_WEBHOOK_URL) {
-    return { status: "not_configured", notifiedAt: "" };
-  }
+function hasSlackWebhookConfig() {
+  return Boolean(process.env.SLACK_WEBHOOK_URL);
+}
 
+function hasSlackFileUploadConfig() {
+  return Boolean(process.env.SLACK_BOT_TOKEN && process.env.SLACK_CHANNEL_ID);
+}
+
+function schemaImageBuffer(dataUrl = "") {
+  if (!dataUrl) return null;
+
+  const match = String(dataUrl).match(/^data:image\/png;base64,([A-Za-z0-9+/=]+)$/);
+  if (!match) return null;
+
+  const buffer = Buffer.from(match[1], "base64");
+  if (!buffer.length) return null;
+  if (buffer.length > 2 * 1024 * 1024) {
+    throw new Error("シェーマ画像が大きすぎます。");
+  }
+  return buffer;
+}
+
+async function slackApi(method, body) {
+  const response = await fetch(`https://slack.com/api/${method}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`,
+      "Content-Type": "application/json; charset=utf-8"
+    },
+    body: JSON.stringify(body)
+  });
+  const data = await response.json();
+  if (!response.ok || !data.ok) {
+    throw new Error(data.error || `Slack API error: ${response.status}`);
+  }
+  return data;
+}
+
+async function postSlackWebhook(text) {
   const response = await fetch(process.env.SLACK_WEBHOOK_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text: buildSlackText(intake) })
+    body: JSON.stringify({ text })
   });
 
   if (!response.ok) {
     throw new Error(`Slack通知に失敗しました: ${response.status}`);
   }
+}
 
-  return { status: "sent", notifiedAt: new Date().toISOString() };
+async function postSlackMessage(text) {
+  await slackApi("chat.postMessage", {
+    channel: process.env.SLACK_CHANNEL_ID,
+    text
+  });
+}
+
+async function uploadSlackSchemaImage({ buffer, intake, initialComment }) {
+  const filename = `intake-schema-${intake.patientId || intake.intakeId}.png`;
+  const title = `問診シェーマ ${intake.patientId || ""}`.trim();
+  const uploadTicket = await slackApi("files.getUploadURLExternal", {
+    filename,
+    length: buffer.length,
+    alt_txt: "問診シェーマ"
+  });
+
+  const uploadResponse = await fetch(uploadTicket.upload_url, {
+    method: "POST",
+    headers: { "Content-Type": "application/octet-stream" },
+    body: buffer
+  });
+
+  if (!uploadResponse.ok) {
+    throw new Error(`Slack画像アップロードに失敗しました: ${uploadResponse.status}`);
+  }
+
+  await slackApi("files.completeUploadExternal", {
+    channel_id: process.env.SLACK_CHANNEL_ID,
+    initial_comment: initialComment,
+    files: [{ id: uploadTicket.file_id, title }]
+  });
+}
+
+async function notifySlack(intake) {
+  const text = buildSlackText(intake);
+  const imageBuffer = schemaImageBuffer(intake.schemaImageDataUrl);
+
+  if (imageBuffer && hasSlackFileUploadConfig()) {
+    await uploadSlackSchemaImage({ buffer: imageBuffer, intake, initialComment: text });
+    return { status: "sent", imageStatus: "sent", notifiedAt: new Date().toISOString() };
+  }
+
+  if (hasSlackWebhookConfig()) {
+    const imageNote =
+      imageBuffer && !hasSlackFileUploadConfig()
+        ? "\n\n※シェーマ画像をSlackに添付するには、SLACK_BOT_TOKEN と SLACK_CHANNEL_ID の設定が必要です。"
+        : "";
+    await postSlackWebhook(`${text}${imageNote}`);
+    return {
+      status: "sent",
+      imageStatus: imageBuffer ? "not_configured" : "none",
+      notifiedAt: new Date().toISOString()
+    };
+  }
+
+  if (hasSlackFileUploadConfig()) {
+    await postSlackMessage(text);
+    return {
+      status: "sent",
+      imageStatus: imageBuffer ? "failed: no_image_upload" : "none",
+      notifiedAt: new Date().toISOString()
+    };
+  }
+
+  return { status: "not_configured", imageStatus: imageBuffer ? "not_configured" : "none", notifiedAt: "" };
 }
 
 function buildIntake({ body, summary, meta }) {
@@ -296,6 +395,7 @@ function buildIntake({ body, summary, meta }) {
     clinicNoticeShown: Boolean(body.clinicNoticeShown),
     answers,
     summary,
+    schemaImageDataUrl: typeof body.schemaImage === "string" ? body.schemaImage : "",
     aiModel: meta.aiModel || "",
     source: "liff-intake"
   };
@@ -304,7 +404,8 @@ function buildIntake({ body, summary, meta }) {
 app.get("/api/config", (req, res) => {
   res.json({
     openaiConfigured: Boolean(process.env.OPENAI_API_KEY),
-    slackConfigured: Boolean(process.env.SLACK_WEBHOOK_URL),
+    slackConfigured: hasSlackWebhookConfig() || hasSlackFileUploadConfig(),
+    slackImageConfigured: hasSlackFileUploadConfig(),
     liffId: process.env.LIFF_ID || "",
     textModel: process.env.OPENAI_TEXT_MODEL || "gpt-5.4-mini"
   });
@@ -329,12 +430,15 @@ app.post("/api/intake/complete", async (req, res, next) => {
     try {
       slack = await notifySlack(intakeBase);
     } catch (slackError) {
-      slack = { status: `failed: ${slackError.message}`, notifiedAt: "" };
+      slack = { status: `failed: ${slackError.message}`, imageStatus: "failed", notifiedAt: "" };
     }
 
+    const { schemaImageDataUrl, ...publicIntakeBase } = intakeBase;
     const intake = {
-      ...intakeBase,
+      ...publicIntakeBase,
+      schemaImageAttached: slack.imageStatus === "sent",
       slackStatus: slack.status,
+      slackImageStatus: slack.imageStatus,
       slackNotifiedAt: slack.notifiedAt
     };
 
@@ -344,6 +448,7 @@ app.post("/api/intake/complete", async (req, res, next) => {
       meta: {
         ...result.meta,
         slackStatus: slack.status,
+        slackImageStatus: slack.imageStatus,
         deliveryTarget: "slack",
         sheetStored: false,
         spreadsheetStored: false

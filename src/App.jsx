@@ -343,6 +343,48 @@ function bodySchemaLabel(value) {
   return schema.note ? `${marks}、補足: ${schema.note}` : marks;
 }
 
+function loadSchemaImage() {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("シェーマ画像の読み込みに失敗しました。"));
+    image.src = "/intake-schema.png";
+  });
+}
+
+async function createBodySchemaImageDataUrl(value) {
+  const schema = parseBodySchema(value);
+  if (!schema.marks.length) return "";
+
+  const image = await loadSchemaImage();
+  const width = image.naturalWidth || image.width || 360;
+  const height = image.naturalHeight || image.height || 420;
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+
+  const context = canvas.getContext("2d");
+  context.fillStyle = "#ffffff";
+  context.fillRect(0, 0, width, height);
+  context.drawImage(image, 0, 0, width, height);
+
+  const radius = Math.max(10, Math.round(width * 0.035));
+  context.lineWidth = Math.max(3, Math.round(width * 0.01));
+  context.strokeStyle = "#d6293f";
+  context.fillStyle = "rgba(214, 41, 63, 0.08)";
+
+  schema.marks.forEach((mark) => {
+    const x = (Number(mark.x) / 100) * width;
+    const y = (Number(mark.y) / 100) * height;
+    context.beginPath();
+    context.arc(x, y, radius, 0, Math.PI * 2);
+    context.fill();
+    context.stroke();
+  });
+
+  return canvas.toDataURL("image/png");
+}
+
 function renderAnswer(question, value) {
   if (question.type === "multiSelect") {
     return Array.isArray(value) && value.length ? value.join("、") : "なし";
@@ -356,6 +398,14 @@ function slackStatusLabel(status) {
   if (status === "not_configured") return "Slack未設定";
   if (status?.startsWith("failed")) return "送信失敗";
   return "未送信";
+}
+
+function slackImageStatusLabel(status) {
+  if (status === "sent") return "画像送信済み";
+  if (status === "not_configured") return "画像送信未設定";
+  if (status === "none") return "画像なし";
+  if (status?.startsWith("failed")) return "画像送信失敗";
+  return "画像なし";
 }
 
 function IntakeBubble({ type, children }) {
@@ -632,10 +682,12 @@ function IntakeApp() {
     setError("");
 
     try {
+      const schemaImage = await createBodySchemaImageDataUrl(answers.bodySchemaMarks);
       const data = await apiJson("/api/intake/complete", {
         method: "POST",
         body: {
           answers,
+          schemaImage,
           startedAt,
           clinicNoticeShown: true,
           lineUserId: liffProfile?.userId || ""
@@ -656,6 +708,7 @@ function IntakeApp() {
 
   const progress = Math.round((Math.min(step, questions.length) / questions.length) * 100);
   const slackStatus = result?.meta?.slackStatus || "";
+  const slackImageStatus = result?.meta?.slackImageStatus || "";
   const slackSent = slackStatus === "sent";
 
   return (
@@ -671,6 +724,7 @@ function IntakeApp() {
         <div className="header-status">
           <StatusChip ok={Boolean(config?.openaiConfigured)}>AI</StatusChip>
           <StatusChip ok={Boolean(config?.slackConfigured)}>Slack</StatusChip>
+          <StatusChip ok={Boolean(config?.slackImageConfigured)}>画像</StatusChip>
           <span className="mode-chip">{config?.liffId ? "LINE" : "プレビュー"}</span>
         </div>
       </header>
@@ -751,6 +805,7 @@ function IntakeApp() {
               Slack通知: {slackStatusLabel(slackStatus)}
               {!slackSent ? "。Slackの環境変数を確認してください。" : ""}
             </p>
+            <p>シェーマ画像: {slackImageStatusLabel(slackImageStatus)}</p>
 
             <div className="summary-box">
               <pre>{result.summary?.soapSubjective || result.intake?.soapSubjective}</pre>
