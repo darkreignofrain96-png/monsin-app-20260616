@@ -247,9 +247,20 @@ function hashLineUserId(lineUserId = "") {
   return crypto.createHmac("sha256", secret).update(lineUserId).digest("hex");
 }
 
+function slackCodeBlock(text) {
+  return String(text || "発言なし").replace(/```/g, "'''").trim();
+}
+
 function buildSlackText(intake) {
+  const copyText = slackCodeBlock(intake.summary.soapSubjective);
   const lines = [
     "*問診要約*",
+    "*コピペ用S（この枠内だけコピー）*",
+    "```",
+    copyText,
+    "```",
+    "",
+    "*確認用情報*",
     `診療区分: ${intake.visitType || "未入力"}`,
     `患者ID: ${intake.patientId || "未入力"}`,
     `緊急度: ${intake.summary.urgencyLevel || "通常"}`,
@@ -262,7 +273,6 @@ function buildSlackText(intake) {
     lines.push(`緊急確認事項: ${intake.summary.redFlags}`);
   }
 
-  lines.push("", "*SOAP S*", "```", intake.summary.soapSubjective || "発言なし", "```");
   return lines.join("\n");
 }
 
