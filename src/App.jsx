@@ -408,6 +408,34 @@ function slackImageStatusLabel(status) {
   return "画像なし";
 }
 
+function slackFailureDetail(status, config) {
+  if (status === "sent") return "";
+  if (status === "not_configured") {
+    const missing = config?.slackMissing || [];
+    return missing.length
+      ? `不足している設定: ${missing.join(", ")}`
+      : "Slack通知用の環境変数が未設定です。";
+  }
+  if (status?.startsWith("failed:")) {
+    return `Slack側のエラー: ${status.replace(/^failed:\s*/, "")}`;
+  }
+  return "Slack通知用の環境変数またはSlack Appの権限を確認してください。";
+}
+
+function slackImageFailureDetail(status, config) {
+  if (status === "sent" || status === "none") return "";
+  if (status === "not_configured") {
+    const missing = config?.slackImageMissing || [];
+    return missing.length
+      ? `画像添付に不足している設定: ${missing.join(", ")}`
+      : "画像添付にはBot TokenとチャンネルIDが必要です。";
+  }
+  if (status?.startsWith("failed:")) {
+    return `画像送信エラー: ${status.replace(/^failed:\s*/, "")}`;
+  }
+  return "";
+}
+
 function IntakeBubble({ type, children }) {
   return <div className={`intake-bubble ${type}`}>{children}</div>;
 }
@@ -710,6 +738,8 @@ function IntakeApp() {
   const slackStatus = result?.meta?.slackStatus || "";
   const slackImageStatus = result?.meta?.slackImageStatus || "";
   const slackSent = slackStatus === "sent";
+  const slackDetail = slackFailureDetail(slackStatus, config);
+  const slackImageDetail = slackImageFailureDetail(slackImageStatus, config);
 
   return (
     <div className="intake-shell">
@@ -803,9 +833,12 @@ function IntakeApp() {
             <h1>{slackSent ? "問診要約をSlackに送信しました" : "問診要約を作成しました"}</h1>
             <p>
               Slack通知: {slackStatusLabel(slackStatus)}
-              {!slackSent ? "。Slackの環境変数を確認してください。" : ""}
+              {slackDetail ? `。${slackDetail}` : ""}
             </p>
-            <p>シェーマ画像: {slackImageStatusLabel(slackImageStatus)}</p>
+            <p>
+              シェーマ画像: {slackImageStatusLabel(slackImageStatus)}
+              {slackImageDetail ? `。${slackImageDetail}` : ""}
+            </p>
 
             <div className="summary-box">
               <pre>{result.summary?.soapSubjective || result.intake?.soapSubjective}</pre>

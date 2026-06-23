@@ -276,12 +276,40 @@ function buildSlackText(intake) {
   return lines.join("\n");
 }
 
+function envValue(name) {
+  return String(process.env[name] || "").trim();
+}
+
 function hasSlackWebhookConfig() {
-  return Boolean(process.env.SLACK_WEBHOOK_URL);
+  return Boolean(envValue("SLACK_WEBHOOK_URL"));
 }
 
 function hasSlackFileUploadConfig() {
-  return Boolean(process.env.SLACK_BOT_TOKEN && process.env.SLACK_CHANNEL_ID);
+  return Boolean(envValue("SLACK_BOT_TOKEN") && envValue("SLACK_CHANNEL_ID"));
+}
+
+function slackConfigState() {
+  const hasWebhook = hasSlackWebhookConfig();
+  const hasBotToken = Boolean(envValue("SLACK_BOT_TOKEN"));
+  const hasChannelId = Boolean(envValue("SLACK_CHANNEL_ID"));
+  const hasFileUpload = hasBotToken && hasChannelId;
+  const missingForText = hasWebhook || hasFileUpload
+    ? []
+    : ["SLACK_WEBHOOK_URL", "または SLACK_BOT_TOKEN + SLACK_CHANNEL_ID"];
+  const missingForImage = hasFileUpload
+    ? []
+    : [
+        hasBotToken ? "" : "SLACK_BOT_TOKEN",
+        hasChannelId ? "" : "SLACK_CHANNEL_ID"
+      ].filter(Boolean);
+
+  return {
+    slackConfigured: hasWebhook || hasFileUpload,
+    slackImageConfigured: hasFileUpload,
+    slackMode: hasFileUpload ? "bot" : hasWebhook ? "webhook" : "none",
+    slackMissing: missingForText,
+    slackImageMissing: missingForImage
+  };
 }
 
 function schemaImageBuffer(dataUrl = "") {
@@ -302,7 +330,7 @@ async function slackApi(method, body) {
   const response = await fetch(`https://slack.com/api/${method}`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`,
+      Authorization: `Bearer ${envValue("SLACK_BOT_TOKEN")}`,
       "Content-Type": "application/json; charset=utf-8"
     },
     body: JSON.stringify(body)
@@ -315,7 +343,7 @@ async function slackApi(method, body) {
 }
 
 async function postSlackWebhook(text) {
-  const response = await fetch(process.env.SLACK_WEBHOOK_URL, {
+  const response = await fetch(envValue("SLACK_WEBHOOK_URL"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ text })
@@ -328,7 +356,7 @@ async function postSlackWebhook(text) {
 
 async function postSlackMessage(text) {
   await slackApi("chat.postMessage", {
-    channel: process.env.SLACK_CHANNEL_ID,
+    channel: envValue("SLACK_CHANNEL_ID"),
     text
   });
 }
@@ -353,7 +381,7 @@ async function uploadSlackSchemaImage({ buffer, intake, initialComment }) {
   }
 
   await slackApi("files.completeUploadExternal", {
-    channel_id: process.env.SLACK_CHANNEL_ID,
+    channel_id: envValue("SLACK_CHANNEL_ID"),
     initial_comment: initialComment,
     files: [{ id: uploadTicket.file_id, title }]
   });
@@ -412,10 +440,10 @@ function buildIntake({ body, summary, meta }) {
 }
 
 app.get("/api/config", (req, res) => {
+  const slackConfig = slackConfigState();
   res.json({
     openaiConfigured: Boolean(process.env.OPENAI_API_KEY),
-    slackConfigured: hasSlackWebhookConfig() || hasSlackFileUploadConfig(),
-    slackImageConfigured: hasSlackFileUploadConfig(),
+    ...slackConfig,
     liffId: process.env.LIFF_ID || "",
     textModel: process.env.OPENAI_TEXT_MODEL || "gpt-5.4-mini"
   });
