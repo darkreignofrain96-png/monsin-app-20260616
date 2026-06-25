@@ -4,6 +4,7 @@ import express from "express";
 import OpenAI from "openai";
 
 const app = express();
+const appVersion = "2026-06-25-slack-diagnostics";
 
 app.use(express.json({ limit: "3mb" }));
 
@@ -326,7 +327,7 @@ function schemaImageBuffer(dataUrl = "") {
   return buffer;
 }
 
-async function slackApi(method, body) {
+async function slackApiRaw(method, body = {}) {
   const response = await fetch(`https://slack.com/api/${method}`, {
     method: "POST",
     headers: {
@@ -336,10 +337,96 @@ async function slackApi(method, body) {
     body: JSON.stringify(body)
   });
   const data = await response.json();
+  return { response, data };
+}
+
+function responseScopes(response, headerName) {
+  return String(response.headers.get(headerName) || "")
+    .split(",")
+    .map((scope) => scope.trim())
+    .filter(Boolean);
+}
+
+function slackMethodResult(method, response, data) {
+  return {
+    method,
+    ok: Boolean(response.ok && data.ok),
+    error: data.ok ? "" : data.error || `Slack API error: ${response.status}`,
+    needed: data.needed || "",
+    provided: data.provided || "",
+    acceptedScopes: responseScopes(response, "x-accepted-oauth-scopes"),
+    currentScopes: responseScopes(response, "x-oauth-scopes")
+  };
+}
+
+async function slackApi(method, body) {
+  const { response, data } = await slackApiRaw(method, body);
   if (!response.ok || !data.ok) {
-    throw new Error(data.error || `Slack API error: ${response.status}`);
+    const details = [data.error || `Slack API error: ${response.status}`];
+    if (data.needed) details.push(`needed=${data.needed}`);
+    if (data.provided) details.push(`provided=${data.provided}`);
+
+    const acceptedScopes = response.headers.get("x-accepted-oauth-scopes");
+    const currentScopes = response.headers.get("x-oauth-scopes");
+    if (acceptedScopes) details.push(`accepted=${acceptedScopes}`);
+    if (currentScopes) details.push(`current=${currentScopes}`);
+
+    throw new Error(`${method}: ${details.join(" / ")}`);
   }
   return data;
+}
+
+async function slackDiagnostics() {
+  const config = slackConfigState();
+  const token = envValue("SLACK_BOT_TOKEN");
+  const requiredScopes = ["chat:write", "files:write"];
+
+  if (!token) {
+    return {
+      ...config,
+      appVersion,
+      tokenConfigured: false,
+      tokenType: "none",
+      authenticated: false,
+      authError: "SLACK_BOT_TOKEN is not configured",
+      currentScopes: [],
+      requiredScopes,
+      missingScopes: requiredScopes
+    };
+  }
+
+  const [
+    { response: authResponse, data: authData },
+    { response: messageResponse, data: messageData },
+    { response: fileResponse, data: fileData }
+  ] = await Promise.all([
+    slackApiRaw("auth.test"),
+    slackApiRaw("chat.postMessage"),
+    slackApiRaw("files.getUploadURLExternal")
+  ]);
+  const methodChecks = [
+    slackMethodResult("chat.postMessage", messageResponse, messageData),
+    slackMethodResult("files.getUploadURLExternal", fileResponse, fileData)
+  ];
+  const currentScopes = [
+    ...new Set([
+      ...responseScopes(authResponse, "x-oauth-scopes"),
+      ...methodChecks.flatMap((check) => check.currentScopes)
+    ])
+  ];
+
+  return {
+    ...config,
+    appVersion,
+    tokenConfigured: true,
+    tokenType: token.startsWith("xoxb-") ? "bot" : "unexpected",
+    authenticated: Boolean(authResponse.ok && authData.ok),
+    authError: authData.ok ? "" : authData.error || `Slack API error: ${authResponse.status}`,
+    currentScopes,
+    requiredScopes,
+    missingScopes: requiredScopes.filter((scope) => !currentScopes.includes(scope)),
+    methodChecks
+  };
 }
 
 async function postSlackWebhook(text) {
@@ -392,8 +479,21 @@ async function notifySlack(intake) {
   const imageBuffer = schemaImageBuffer(intake.schemaImageDataUrl);
 
   if (imageBuffer && hasSlackFileUploadConfig()) {
-    await uploadSlackSchemaImage({ buffer: imageBuffer, intake, initialComment: text });
-    return { status: "sent", imageStatus: "sent", notifiedAt: new Date().toISOString() };
+    try {
+      await uploadSlackSchemaImage({ buffer: imageBuffer, intake, initialComment: text });
+      return { status: "sent", imageStatus: "sent", notifiedAt: new Date().toISOString() };
+    } catch (imageError) {
+      if (!hasSlackWebhookConfig()) throw imageError;
+
+      await postSlackWebhook(
+        `${text}\n\n※シェーマ画像の送信に失敗しました: ${imageError.message}`
+      );
+      return {
+        status: "sent",
+        imageStatus: `failed: ${imageError.message}`,
+        notifiedAt: new Date().toISOString()
+      };
+    }
   }
 
   if (hasSlackWebhookConfig()) {
@@ -442,11 +542,20 @@ function buildIntake({ body, summary, meta }) {
 app.get("/api/config", (req, res) => {
   const slackConfig = slackConfigState();
   res.json({
+    appVersion,
     openaiConfigured: Boolean(process.env.OPENAI_API_KEY),
     ...slackConfig,
     liffId: process.env.LIFF_ID || "",
     textModel: process.env.OPENAI_TEXT_MODEL || "gpt-5.4-mini"
   });
+});
+
+app.get("/api/slack/diagnostics", async (req, res, next) => {
+  try {
+    res.json(await slackDiagnostics());
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.post("/api/intake/complete", async (req, res, next) => {
