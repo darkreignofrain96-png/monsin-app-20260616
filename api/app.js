@@ -4,7 +4,7 @@ import express from "express";
 import OpenAI from "openai";
 
 const app = express();
-const appVersion = "2026-06-25-slack-diagnostics";
+const appVersion = "2026-06-25-slack-upload-form";
 
 app.use(express.json({ limit: "3mb" }));
 
@@ -359,19 +359,46 @@ function slackMethodResult(method, response, data) {
   };
 }
 
+function throwSlackApiError(method, response, data) {
+  const details = [data.error || `Slack API error: ${response.status}`];
+  if (data.needed) details.push(`needed=${data.needed}`);
+  if (data.provided) details.push(`provided=${data.provided}`);
+
+  const messages = data.response_metadata?.messages;
+  if (Array.isArray(messages) && messages.length) {
+    details.push(`details=${messages.join(", ")}`);
+  }
+
+  const acceptedScopes = response.headers.get("x-accepted-oauth-scopes");
+  const currentScopes = response.headers.get("x-oauth-scopes");
+  if (acceptedScopes) details.push(`accepted=${acceptedScopes}`);
+  if (currentScopes) details.push(`current=${currentScopes}`);
+
+  throw new Error(`${method}: ${details.join(" / ")}`);
+}
+
 async function slackApi(method, body) {
   const { response, data } = await slackApiRaw(method, body);
   if (!response.ok || !data.ok) {
-    const details = [data.error || `Slack API error: ${response.status}`];
-    if (data.needed) details.push(`needed=${data.needed}`);
-    if (data.provided) details.push(`provided=${data.provided}`);
+    throwSlackApiError(method, response, data);
+  }
+  return data;
+}
 
-    const acceptedScopes = response.headers.get("x-accepted-oauth-scopes");
-    const currentScopes = response.headers.get("x-oauth-scopes");
-    if (acceptedScopes) details.push(`accepted=${acceptedScopes}`);
-    if (currentScopes) details.push(`current=${currentScopes}`);
-
-    throw new Error(`${method}: ${details.join(" / ")}`);
+async function slackFormApi(method, fields) {
+  const response = await fetch(`https://slack.com/api/${method}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${envValue("SLACK_BOT_TOKEN")}`,
+      "Content-Type": "application/x-www-form-urlencoded; charset=utf-8"
+    },
+    body: new URLSearchParams(
+      Object.entries(fields).map(([key, value]) => [key, String(value)])
+    ).toString()
+  });
+  const data = await response.json();
+  if (!response.ok || !data.ok) {
+    throwSlackApiError(method, response, data);
   }
   return data;
 }
@@ -449,12 +476,15 @@ async function postSlackMessage(text) {
 }
 
 async function uploadSlackSchemaImage({ buffer, intake, initialComment }) {
-  const filename = `intake-schema-${intake.patientId || intake.intakeId}.png`;
+  const fileId = String(intake.patientId || intake.intakeId || "unknown")
+    .replace(/[^A-Za-z0-9._-]/g, "-")
+    .replace(/-+/g, "-")
+    .slice(0, 80);
+  const filename = `intake-schema-${fileId || "unknown"}.png`;
   const title = `問診シェーマ ${intake.patientId || ""}`.trim();
-  const uploadTicket = await slackApi("files.getUploadURLExternal", {
+  const uploadTicket = await slackFormApi("files.getUploadURLExternal", {
     filename,
-    length: buffer.length,
-    alt_txt: "問診シェーマ"
+    length: buffer.length
   });
 
   const uploadResponse = await fetch(uploadTicket.upload_url, {
